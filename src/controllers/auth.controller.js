@@ -14,9 +14,9 @@ const signToken = (userId) => {
 
 export const register = async (req, res) => {
   try {
-    const { firstName, lastName, email, password } = req.body;
+    const { first_name, last_name, email, password } = req.body;
 
-    if (!firstName || !lastName || !email || !password) {
+    if (!first_name || !last_name || !email || !password) {
       return res.status(400).json({ error: "Missing fields" });
     }
 
@@ -39,7 +39,7 @@ export const register = async (req, res) => {
       `INSERT INTO users (first_name, last_name, email, password, is_verified, credit_score)
        VALUES ($1,$2,$3,$4,$5,$6)
        RETURNING id, first_name, last_name, email, credit_score`,
-      [firstName, lastName || null, normalizedEmail, hashed, true, 720]  // force 720 for now
+      [first_name, last_name || null, normalizedEmail, hashed, true, 720]  // force 720 for now
     );
     const user = result[0];
     const token = signToken(user.id);
@@ -53,7 +53,6 @@ export const register = async (req, res) => {
 
 export const login = async (req, res) => {
   try {
-    console.log("Login attempt:", req.body);
     const { email, password } = req.body;
 
     const normalizedEmail = email.toLowerCase();
@@ -86,7 +85,6 @@ export const login = async (req, res) => {
     };
 
     res.json({ user: safeUser, token });
-    console.log("Login successful for user:", safeUser, "Token:", token);
   } catch (err) {
     console.error("login error:", err);
     res.status(500).json({ error: "server_error" });
