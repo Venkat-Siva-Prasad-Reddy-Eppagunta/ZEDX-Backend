@@ -1,103 +1,150 @@
-// src/controllers/plaid.controller.js
 import { pool } from '../config/db.js';
 import { plaidClient } from '../config/plaid.js';
 
 /**
- * Create a Link Token — Plaid Quickstart standard
+ * Create Plaid Link Token (Cards OR Bank)
  */
 export const createLinkToken = async (req, res) => {
   try {
     const userId = req.userId;
-    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+    const { flow } = req.query;
+
+    if (!flow) {
+      return res.status(400).json({ error: 'flow query param is required' });
+    }
+
+    let products = [];
+
+    if (flow === 'cards') {
+      products = ['transactions', 'liabilities'];
+    } else if (flow === 'bank') {
+      products = ['auth'];
+    } else {
+      return res.status(400).json({ error: 'Invalid flow type' });
+    }
 
     const response = await plaidClient.linkTokenCreate({
       user: { client_user_id: String(userId) },
-      client_name: "ZEDX App",
-      products: ["transactions", "liabilities"], // Quickstart uses "auth" too
-      country_codes: ["US"],
-      language: "en",
+      client_name: 'ZEDX App',
+      products,
+      country_codes: ['US'],
+      language: 'en'
     });
 
-    return res.json(response.data); // { link_token, expiration, etc. }
+    res.json(response.data);
   } catch (err) {
-    console.error("createLinkToken err:", err.response?.data ?? err);
-    return res.status(500).json({ error: err.response?.data ?? err.message });
+    console.error('createLinkToken error:', err.response?.data ?? err);
+    res.status(500).json({ error: err.message });
   }
 };
 
 /**
- * Exchange public_token → access_token, persist token & fetch accounts/liabilities
+ * Exchange Public Token → Credit Cards
  */
-export const exchangePublicToken = async (req, res) => {
+export const exchangeCardToken = async (req, res) => {
   try {
     const userId = req.userId;
     const { public_token } = req.body;
 
-    if (!public_token || !userId) {
-      return res.status(400).json({ error: "public_token required" });
+    if (!public_token) {
+      return res.status(400).json({ error: 'public_token required' });
     }
 
-    // Exchange public_token → access_token
     const exchangeRes = await plaidClient.itemPublicTokenExchange({ public_token });
     const access_token = exchangeRes.data.access_token;
     const item_id = exchangeRes.data.item_id;
 
-    // Store/Upsert the access_token
     await pool.query(
-      `INSERT INTO plaid_items (user_id, access_token, item_id)
-        VALUES ($1, $2, $3)
-       ON CONFLICT (user_id) DO UPDATE SET access_token = EXCLUDED.access_token, item_id = EXCLUDED.item_id`,
+      `INSERT INTO plaid_items (user_id, access_token, item_id, type)
+       VALUES ($1,$2,$3,'cards')
+       ON CONFLICT (user_id, type)
+       DO UPDATE SET access_token=EXCLUDED.access_token, item_id=EXCLUDED.item_id`,
       [userId, access_token, item_id]
     );
 
-    // Fetch accounts
     const accountsRes = await plaidClient.accountsGet({ access_token });
     const accounts = accountsRes.data.accounts;
 
-    // Optionally fetch liabilities
-    let liabilitiesObj = null;
+    let liabilities = null;
     try {
       const liabRes = await plaidClient.liabilitiesGet({ access_token });
-      liabilitiesObj = liabRes.data.liabilities;
-    } catch (liabErr) {
-      console.warn(
-        "Plaid liabilitiesGet product not ready (OK in sandbox)",
-        liabErr.response?.data ?? liabErr.message
+      liabilities = liabRes.data.liabilities;
+    } catch {}
+
+    const creditAccounts = accounts.filter(a => a.type === 'credit');
+
+    for (const acc of creditAccounts) {
+      const liabilityMatch = liabilities?.credit?.find(
+        l => l.account_id === acc.account_id
       );
-      liabilitiesObj = null;
+      await upsertCreditCard(userId, acc, liabilityMatch);
     }
 
-    // Upsert credit cards + liabilities into DB
-const creditAccounts = accounts.filter(a => a.type === "credit");
-
-for (const acc of creditAccounts) {
-  let liabilityMatch = null;
-  if (liabilitiesObj && Array.isArray(liabilitiesObj.credit)) {
-    liabilityMatch = liabilitiesObj.credit.find(
-      liab =>
-        liab.account_id === acc.account_id ||
-        (liab.account_ids && liab.account_ids.includes(acc.account_id))
-    );
-  }
-
-  await upsertCreditCard(userId, acc, liabilityMatch);
-}
-
-    // Return stored cards
     const savedCards = await pool.query(
-      `SELECT *
-       FROM credit_cards 
-       WHERE user_id = $1`,
+      'SELECT * FROM credit_cards WHERE user_id=$1',
       [userId]
     );
 
-    return res.json({ success: true, cards: savedCards });
+    res.json({ success: true, cards: savedCards });
   } catch (err) {
-    console.error("exchangePublicToken err:", err.response?.data ?? err);
-    return res.status(500).json({ error: err.response?.data ?? err.message });
+    console.error('exchangeCardToken error:', err.response?.data ?? err);
+    res.status(500).json({ error: err.message });
   }
 };
 
+/**
+ * Exchange Public Token → Bank Account → Dwolla Processor Token
+ */
+export const exchangeBankToken = async (req, res) => {
+  try {
+    const userId = req.userId;
+    const { public_token } = req.body;
+
+    if (!public_token) {
+      return res.status(400).json({ error: 'public_token required' });
+    }
+
+    const exchangeRes = await plaidClient.itemPublicTokenExchange({ public_token });
+    const access_token = exchangeRes.data.access_token;
+    const item_id = exchangeRes.data.item_id;
+
+    await pool.query(
+      `INSERT INTO plaid_items (user_id, access_token, item_id, type)
+       VALUES ($1,$2,$3,'bank')
+       ON CONFLICT (user_id, type)
+       DO UPDATE SET access_token=EXCLUDED.access_token, item_id=EXCLUDED.item_id`,
+      [userId, access_token, item_id]
+    );
+
+    const accountsRes = await plaidClient.accountsGet({ access_token });
+
+    const bankAccount = accountsRes.data.accounts.find(
+      a => a.type === 'depository'
+    );
+
+    if (!bankAccount) {
+      return res.status(400).json({ error: 'No bank account found' });
+    }
+
+    const processorRes = await plaidClient.processorTokenCreate({
+      access_token,
+      account_id: bankAccount.account_id,
+      processor: 'dwolla'
+    });
+
+    res.json({
+      success: true,
+      processorToken: processorRes.data.processor_token
+    });
+  } catch (err) {
+    console.error('exchangeBankToken error:', err.response?.data ?? err);
+    res.status(500).json({ error: err.message });
+  }
+};
+
+/**
+ * Helper: Upsert Credit Card
+ */
 async function upsertCreditCard(userId, account, liability) {
   const {
     account_id,
@@ -109,50 +156,40 @@ async function upsertCreditCard(userId, account, liability) {
   const total_due = liability?.last_statement_balance || 0;
   const min_due = liability?.minimum_payment_amount || 0;
   const next_due_date = liability?.next_payment_due_date || null;
-  const available_balance = account.balances.available == null ? (limit - current) : account.balances.available;
+  const available_balance = account.balances.available ?? (limit - current);
 
   const existing = await pool.query(
-    "SELECT id FROM credit_cards WHERE account_id = $1",
+    'SELECT id FROM credit_cards WHERE account_id=$1',
     [account_id]
   );
 
-  if (existing?.length) {
-    const id = existing[0].id;
+  if (existing[0]) {
     await pool.query(
       `UPDATE credit_cards SET
-         user_id=$1, name=$2, mask=$3, current_balance=$4,
-         available_balance=$5, credit_limit=$6,
-         total_due=$7, min_due=$8, next_due_date=$9,
-         updated_at=NOW()
-       WHERE id=$10`,
-      [userId, name, mask, current, available_balance, limit, total_due, min_due, next_due_date, id]
+        user_id=$1, name=$2, mask=$3, current_balance=$4,
+        available_balance=$5, credit_limit=$6,
+        total_due=$7, min_due=$8, next_due_date=$9,
+        updated_at=NOW()
+       WHERE account_id=$10`,
+      [
+        userId, name, mask, current,
+        available_balance, limit,
+        total_due, min_due, next_due_date,
+        account_id
+      ]
     );
-    return id;
   } else {
-    const insert = await pool.query(
+    await pool.query(
       `INSERT INTO credit_cards
-         (user_id, account_id, name, mask, current_balance, available_balance, credit_limit, total_due, min_due, next_due_date)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-       RETURNING id`,
-      [userId, account_id, name, mask, current, available_balance, limit, total_due, min_due, next_due_date]
+        (user_id, account_id, name, mask, current_balance,
+         available_balance, credit_limit, total_due,
+         min_due, next_due_date)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [
+        userId, account_id, name, mask,
+        current, available_balance, limit,
+        total_due, min_due, next_due_date
+      ]
     );
-    return insert[0].id;
-  }
-}
-export const getCreditCardAccounts = async (req, res) => {
-  try {
-    const { userId } = req.params;
-
-    const result = await pool.query(
-      `SELECT *
-       FROM credit_cards
-       WHERE user_id = $1`,
-      [userId]
-    );
-
-    res.json({ creditCards: result });
-  } catch (err) {
-    console.error("getCreditCardAccounts error:", err);
-    res.status(500).json({ error: "server_error" });
   }
 }

@@ -28,7 +28,7 @@ export const register = async (req, res) => {
       [normalizedEmail]
     );
 
-    if (exists.rows && exists.rows.length > 0) {
+    if (exists && exists.length > 0) {
       return res.status(400).json({ error: "User already exists" });
     }
 
@@ -81,6 +81,7 @@ export const login = async (req, res) => {
       first_name: user.first_name,
       last_name: user.last_name,
       credit_score: user.credit_score,
+      is_verified: user.is_verified,
       cards: cardRes
     };
 
