@@ -2,7 +2,7 @@ import express from 'express';
 import {
   createLinkToken,
   exchangeCardToken,
-  exchangeBankToken
+  linkBankAccount
 } from '../controllers/plaid.controller.js';
 import { requireAuth } from '../middleware/auth.js';
 
@@ -15,6 +15,6 @@ router.post('/create-link-token', requireAuth, createLinkToken);
 router.post('/exchange-card-token', requireAuth, exchangeCardToken);
 
 // Bank Account → Dwolla
-router.post('/exchange-bank-token', requireAuth, exchangeBankToken);
+router.post('/exchange-bank-token', requireAuth, linkBankAccount);
 
 export default router;

@@ -1,5 +1,6 @@
 import { pool } from '../config/db.js';
 import { plaidClient } from '../config/plaid.js';
+import { dwollaClient } from '../config/dwolla.js';
 
 /**
  * Create Plaid Link Token (Cards OR Bank)
@@ -13,23 +14,37 @@ export const createLinkToken = async (req, res) => {
       return res.status(400).json({ error: 'flow query param is required' });
     }
 
-    let products = [];
+  let products;
+  let account_filters;
 
-    if (flow === 'cards') {
-      products = ['transactions', 'liabilities'];
-    } else if (flow === 'bank') {
+  if (flow === 'cards') {
+    products = ['transactions', 'liabilities'];
+    account_filters = {
+      credit: {
+        account_subtypes: ['credit card']
+      }
+  };
+
+  } else if (flow === 'bank') {
       products = ['auth'];
-    } else {
-      return res.status(400).json({ error: 'Invalid flow type' });
-    }
+      account_filters = {
+        depository: {
+          account_subtypes: ['checking', 'savings']
+        }
+    };
 
-    const response = await plaidClient.linkTokenCreate({
-      user: { client_user_id: String(userId) },
-      client_name: 'ZEDX App',
-      products,
-      country_codes: ['US'],
-      language: 'en'
-    });
+  } else {
+      return res.status(400).json({ error: 'Invalid flow type' });
+  }
+
+  const response = await plaidClient.linkTokenCreate({
+    user: { client_user_id: String(userId) },
+    client_name: 'ZEDX App',
+    products,
+    country_codes: ['US'],
+    language: 'en',
+    account_filters
+  });
 
     res.json(response.data);
   } catch (err) {
@@ -92,9 +107,229 @@ export const exchangeCardToken = async (req, res) => {
   }
 };
 
+
+
+
+
 /**
  * Exchange Public Token → Bank Account → Dwolla Processor Token
  */
+export const linkBankAccount = async (req, res) => {
+  try {
+    const userId = req.userId;
+    const { public_token } = req.body;
+
+    if (!public_token) {
+      return res.status(400).json({ error: 'public_token required' });
+    }
+
+    /**
+     * 1️⃣ Fetch Dwolla Customer
+     */
+    const customerRes = await pool.query(
+      'SELECT dwolla_customer_id FROM dwolla_customers WHERE user_id = $1',
+      [userId]
+    );
+    console.log("customerRes:", customerRes);
+    if (!customerRes[0].dwolla_customer_id) {
+      return res.status(404).json({ error: 'Dwolla customer not found' });
+    }
+
+    const dwollaCustomerId = customerRes[0].dwolla_customer_id;
+
+    /**
+     * 2️⃣ Check if funding source already exists in DB
+     */
+    const existingFs = await pool.query(
+      `
+      SELECT *
+      FROM dwolla_funding_sources
+      WHERE user_id = $1 AND status != 'removed'
+      LIMIT 1
+      `,
+      [userId]
+    );
+
+    console.log("existingFs:", existingFs[0]);
+
+    if (existingFs.length > 0) {
+      return res.json({
+        success: true,
+        fundingSource: existingFs[0],
+        reused: true
+      });
+    }
+
+    /**
+     * 3️⃣ Exchange public_token → access_token
+     */
+    const exchangeRes = await plaidClient.itemPublicTokenExchange({
+      public_token
+    });
+
+    const access_token = exchangeRes.data.access_token;
+    const item_id = exchangeRes.data.item_id;
+
+    /**
+     * 4️⃣ Persist Plaid Item
+     */
+    await pool.query(
+      `
+      INSERT INTO plaid_items (user_id, access_token, item_id, type)
+      VALUES ($1, $2, $3, 'bank')
+      ON CONFLICT (user_id, type)
+      DO UPDATE SET access_token = EXCLUDED.access_token,
+                    item_id = EXCLUDED.item_id
+      `,
+      [userId, access_token, item_id]
+    );
+
+    /**
+     * 5️⃣ Fetch accounts & enforce EXACTLY ONE depository account
+     */
+    const accountsRes = await plaidClient.accountsGet({ access_token });
+
+    const depositoryAccounts = accountsRes.data.accounts.filter(
+      a => a.type === 'depository'
+    );
+
+    if (depositoryAccounts.length !== 1) {
+      return res.status(400).json({
+        error: 'Please select exactly one checking or savings account'
+      });
+    }
+
+    const bankAccount = depositoryAccounts[0];
+
+    /**
+     * 6️⃣ Create Plaid → Dwolla processor token
+     */
+    const processorRes = await plaidClient.processorTokenCreate({
+      access_token,
+      account_id: bankAccount.account_id,
+      processor: 'dwolla'
+    });
+
+    const processorToken = processorRes.data.processor_token;
+
+    /**
+     * 7️⃣ Fetch Dwolla Exchange Partner (Plaid)
+     */
+    const partnersRes = await dwollaClient.get('exchange-partners');
+
+    const partners = partnersRes.body._embedded['exchange-partners'];
+    const plaidPartner = partners.find(p => p.name === 'Plaid');
+
+    if (!plaidPartner) {
+      throw new Error('Plaid exchange partner not found');
+    }
+
+    const exchangePartnerHref = plaidPartner._links.self.href;
+
+    /**
+     * 8️⃣ Create Dwolla Exchange
+     */
+    const exchangeDwollaRes = await dwollaClient.post(
+      `customers/${dwollaCustomerId}/exchanges`,
+      {
+        _links: {
+          'exchange-partner': {
+            href: exchangePartnerHref
+          }
+        },
+        token: processorToken
+      }
+    );
+
+    const exchangeUrl = exchangeDwollaRes.headers.get('location');
+
+    /**
+     * 9️⃣ Create Dwolla Funding Source
+     */
+    const bankAccountType =
+      bankAccount.subtype === 'savings' ? 'savings' : 'checking';
+
+    let fundingSourceId;
+
+    try {
+      const fsRes = await dwollaClient.post(
+        `customers/${dwollaCustomerId}/funding-sources`,
+        {
+          _links: {
+            exchange: {
+              href: exchangeUrl
+            }
+          },
+          bankAccountType,
+          name: bankAccount.name || 'Bank Account'
+        }
+      );
+
+      const fsUrl = fsRes.headers.get('location');
+      fundingSourceId = fsUrl.split('/').pop();
+
+      const fundingRes = await pool.query(
+      `
+      INSERT INTO dwolla_funding_sources
+      (user_id, dwolla_customer_id, last4, funding_source_id, name, type, status)
+      VALUES ($1, $2, $3, $4, $5, $6, 'verified')
+      ON CONFLICT (funding_source_id)
+      DO NOTHING
+      `,
+      [userId, dwollaCustomerId, bankAccount.mask, fundingSourceId, bankAccount.name || 'Bank Account', bankAccountType]
+    );
+
+    /**
+     * ✅ Success
+     */
+    res.json({
+      success: true,
+      fundingSource: fundingRes[0]
+    });
+
+    } catch (err) {
+      /**
+       * 🔁 Handle DuplicateResource (bank already exists in Dwolla)
+       */
+      const dwollaErr = err?.body;
+
+      if (dwollaErr?.code === 'DuplicateResource') {
+        const existingUrl = dwollaErr._links?.about?.href;
+        fundingSourceId = existingUrl.split('/').pop();
+      } else {
+        throw err;
+      }
+    }
+
+    /**
+     * 🔟 Persist Funding Source (idempotent)
+     */
+    const fsRes = await pool.query(
+      `
+      INSERT INTO dwolla_funding_sources
+      (user_id, dwolla_customer_id, last4, funding_source_id, name, type, status)
+      VALUES ($1, $2, $3, $4, $5, $6,'verified')
+      ON CONFLICT (funding_source_id)
+      DO NOTHING
+      `,
+      [userId, dwollaCustomerId, bankAccount.mask, fundingSourceId, bankAccount.name || 'Bank Account', bankAccountType]
+    );
+
+    /**
+     * ✅ Success
+     */
+    res.json({
+      success: true,
+      fundingSource: fsRes[0]
+    });
+
+  } catch (err) {
+    console.error('linkBankAccount error:', err.response?.data || err);
+    res.status(500).json({ error: 'Failed to link bank account' });
+  }
+};
+
+
 export const exchangeBankToken = async (req, res) => {
   try {
     const userId = req.userId;
