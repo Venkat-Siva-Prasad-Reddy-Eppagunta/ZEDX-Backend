@@ -1,3 +1,8 @@
+<p align="center">
+  <img src="./icon.png" alt="ZEDX Logo" width="80" />
+</p>
+
+<h1 align="center">ZEDX</h1>
 
 # ZEDX Backend
 
