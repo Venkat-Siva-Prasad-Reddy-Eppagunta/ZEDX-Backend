@@ -64,21 +64,20 @@ Setup:
    npm install
 4. Create a .env file:
    ```sh
-     PORT = 5001
-    DB_URL = your_own_DB_URL
-    EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY = Your_Own_KEY
-    PLAID_CLIENT_ID = Your_Own_KEY
-    PLAID_SECRET = Your_Own_KEY
-    JWT_SECRET = Your_Own_KEY
-    DWOLLA_ENV = sandbox          # sandbox | production
-    DWOLLA_KEY = Your_Own_KEY
-    DWOLLA_SECRET = Your_Own_KEY
-    DWOLLA_BASE_URL = your_OWN_URL
-    SSN_ENCRYPTION_KEY = Your_Own_KEY
+   PORT = 5001
+   DB_URL = your_own_DB_URL
+   EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY = Your_Own_KEY
+   PLAID_CLIENT_ID = Your_Own_KEY
+   PLAID_SECRET = Your_Own_KEY
+   JWT_SECRET = Your_Own_KEY
+   DWOLLA_ENV = sandbox          # sandbox | production
+   DWOLLA_KEY = Your_Own_KEY
+   DWOLLA_SECRET = Your_Own_KEY
+   DWOLLA_BASE_URL = your_OWN_URL
+   SSN_ENCRYPTION_KEY = Your_Own_KEY
 5. Running the App
    ```sh
    npm run dev
-
 
 ## Running the Server
 
