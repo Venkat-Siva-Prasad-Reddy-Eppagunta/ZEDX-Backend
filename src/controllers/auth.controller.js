@@ -28,7 +28,7 @@ export const register = async (req, res) => {
       [normalizedEmail]
     );
 
-    if (exists.rows && exists.rows.length > 0) {
+    if (exists && exists.length > 0) {
       return res.status(400).json({ error: "User already exists" });
     }
 
@@ -54,7 +54,6 @@ export const register = async (req, res) => {
 export const login = async (req, res) => {
   try {
     const { email, password } = req.body;
-
     const normalizedEmail = email.toLowerCase();
 
     const result = await pool.query(
@@ -68,25 +67,89 @@ export const login = async (req, res) => {
     const ok = await bcrypt.compare(password, user.password);
     if (!ok) return res.status(400).json({ error: "Invalid credentials" });
 
-    const cardRes = await pool.query(
-      "SELECT * FROM credit_cards WHERE user_id=$1",
-      [user.id]
-    );
-
     const token = signToken(user.id);
 
-    const safeUser = {
-      id: user.id,
-      email: user.email,
-      first_name: user.first_name,
-      last_name: user.last_name,
-      credit_score: user.credit_score,
-      cards: cardRes
-    };
-
-    res.json({ user: safeUser, token });
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        email: user.email,
+        first_name: user.first_name,
+        last_name: user.last_name,
+        credit_score: user.credit_score,
+        is_verified: user.is_verified
+      }
+    });
   } catch (err) {
     console.error("login error:", err);
     res.status(500).json({ error: "server_error" });
+  }
+};
+
+
+export const getMe = async (req, res) => {
+  try {
+    const userId = req.userId;
+
+    // 1️⃣ User
+    const userRes = await pool.query(
+      `SELECT id, email, first_name, last_name, credit_score, is_verified
+       FROM users WHERE id=$1`,
+      [userId]
+    );
+
+    if (!userRes[0]) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // 2️⃣ Credit Cards
+    const cards = await pool.query(
+      `SELECT * FROM credit_cards WHERE user_id=$1 ORDER BY id DESC`,
+      [userId]
+    );
+
+    // 3️⃣ Dwolla Customer
+    const dwollaCustomer = await pool.query(
+      `SELECT dwolla_customer_id, status
+       FROM dwolla_customers
+       WHERE user_id=$1`,
+      [userId]
+    );
+
+    // 4️⃣ Funding Sources
+    const fundingSources = await pool.query(
+      `
+      SELECT *
+      FROM dwolla_funding_sources
+      WHERE user_id=$1 AND status != 'removed'
+      ORDER BY id DESC
+      `,
+      [userId]
+    );
+
+    // 5️⃣ Payments (latest 20)
+    const payments = await pool.query(
+      `
+      SELECT p.*, c.name AS card_name, fs.name AS bank_name
+      FROM payments p
+      LEFT JOIN credit_cards c ON p.credit_card_id = c.id
+      LEFT JOIN dwolla_funding_sources fs ON p.funding_source_id = fs.id
+      WHERE p.user_id=$1
+      ORDER BY p.created_at DESC
+      LIMIT 20
+      `,
+      [userId]
+    );
+
+    res.json({
+      user: userRes[0],
+      cards,
+      fundingSources,
+      payments,
+      dwolla: dwollaCustomer[0] || null
+    });
+  } catch (err) {
+    console.error('getMe error:', err);
+    res.status(500).json({ error: 'Failed to load user data' });
   }
 };
